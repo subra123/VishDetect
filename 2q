@@ -1,0 +1,160 @@
+import os
+import subprocess
+import threading
+import queue
+import time
+import json
+from dotenv import load_dotenv
+from deepgram import DeepgramClient
+from deepgram.core.events import EventType
+
+load_dotenv()
+
+# --- CONFIGURATION ---
+SPEAKER_DEVICE = "@DEFAULT_SINK@.monitor"
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+MODEL_NAME = "phi3:mini"
+
+# Timing for Scam Analysis
+ANALYSIS_INTERVAL = 20  # Run analysis every 20 seconds
+TRANSCRIPT_WINDOW = 30  # Analyze the last 30 seconds of conversation
+
+# --- GLOBAL STORAGE ---
+transcript_buffer = []  # List of {timestamp, text, label}
+buffer_lock = threading.Lock()
+active_connections = []
+connections_lock = threading.Lock()
+ready_count = 0
+ready_condition = threading.Condition()
+
+client = DeepgramClient(api_key=DEEPGRAM_API_KEY)
+
+def call_local_llm(prompt):
+    """Calls Ollama via subprocess to get a scam analysis."""
+    try:
+        # We use --nowordwrap and a compact prompt for speed on GTX 1650
+        result = subprocess.run(
+            ['ollama', 'run', MODEL_NAME, '--nowordwrap'],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        return result.stdout.strip()
+    except Exception as e:
+        return f"Error calling Ollama: {e}"
+
+def analyze_scam_risk():
+    """Background thread that periodically checks the buffer for scams."""
+    print(f"🔍 Scam Detection Active (using {MODEL_NAME})")
+    
+    while True:
+        time.sleep(ANALYSIS_INTERVAL)
+        
+        now = time.time()
+        with buffer_lock:
+            # Only analyze text from the last X seconds
+            recent_entries = [
+                f"{e['label']}: {e['text']}" 
+                for e in transcript_buffer 
+                if now - e['timestamp'] < TRANSCRIPT_WINDOW
+            ]
+        
+        if not recent_entries:
+            continue
+
+        full_transcript = "\n".join(recent_entries)
+        
+        # Optimized Prompt for fast JSON output
+        prompt = f"""
+        Analyze this call for vishing (scam). Output ONLY JSON.
+        TRANSCRIPT:
+        {full_transcript}
+
+        JSON format:
+        {{"risk_score": 0-100, "reason": "brief explanation", "threats": ["list"], "action": "advice"}}
+        """
+
+        print("\n🧠 [LLM] Analyzing conversation for risk...")
+        analysis_raw = call_local_llm(prompt)
+        
+        # Print the raw analysis results
+        print(f"🛡️  [SCAM REPORT]\n{analysis_raw}\n{'-'*30}")
+
+def start_deepgram_stream(language_config, label):
+    """Opens a dedicated Deepgram connection for a specific language."""
+    global ready_count
+    
+    with client.listen.v1.connect(
+        model="nova-3", language=language_config, encoding="linear16", sample_rate=16000, channels=1
+    ) as connection:
+        
+        def on_open(_):
+            global ready_count
+            with ready_condition:
+                ready_count += 1
+                ready_condition.notify_all()
+            print(f"✅ Deepgram [{label}] stream connected!")
+
+        def on_message(result):
+            channel = getattr(result, "channel", None)
+            if channel and channel.alternatives:
+                text = channel.alternatives[0].transcript
+                if text:
+                    print(f"[{label}]: {text}")
+                    # Push into the global buffer for the LLM to read
+                    with buffer_lock:
+                        transcript_buffer.append({
+                            "timestamp": time.time(),
+                            "text": text,
+                            "label": label
+                        })
+                        # Keep buffer lean (last 100 entries)
+                        if len(transcript_buffer) > 100:
+                            transcript_buffer.pop(0)
+
+        connection.on(EventType.OPEN, on_open)
+        connection.on(EventType.MESSAGE, on_message)
+        
+        with connections_lock:
+            active_connections.append(connection)
+        
+        connection.start_listening()
+
+def capture_speakers():
+    """Captures system audio and broadcasts it."""
+    with ready_condition:
+        ready_condition.wait_for(lambda: ready_count == 3)
+        
+    print("\n🔊 All streams ready. Monitoring call for scams...\n")
+    
+    proc = subprocess.Popen(
+        ["parecord", f"--device={SPEAKER_DEVICE}", "--format=s16le", "--rate=16000", "--channels=1", "--raw"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    
+    try:
+        while True:
+            data = proc.stdout.read(2048)
+            if not data: break
+            with connections_lock:
+                for conn in active_connections:
+                    try:
+                        conn.send_media(data)
+                    except: pass
+    finally:
+        proc.terminate()
+
+if __name__ == "__main__":
+    # 1. Start Language Streams
+    for lang, label in [("multi", "EN/HI"), ("ta", "TAMIL"), ("te", "TELUGU")]:
+        threading.Thread(target=start_deepgram_stream, args=(lang, label), daemon=True).start()
+
+    # 2. Start Scam Analysis Thread
+    threading.Thread(target=analyze_scam_risk, daemon=True).start()
+
+    # 3. Start Audio Capture (Main Thread)
+    try:
+        capture_speakers()
+    except KeyboardInterrupt:
+        print("\n🛑 Exiting...")

@@ -9,6 +9,8 @@ import audioop
 from deepgram import DeepgramClient
 from deepgram.core.events import EventType
 
+print("DEBUG DG KEY:", repr(os.getenv("DEEPGRAM_API_KEY")))
+
 # Now this will actually find the key
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
